@@ -11,6 +11,8 @@ const FontInjector = () => {
   }, []);
   return null;
 };
+const API = import.meta.env.VITE_API_URL;
+
 
 /* ─── Inline global styles ───────────────────────────────────────────────────── */
 const STYLES = `
@@ -749,7 +751,7 @@ export default function App() {
   const poll = (taskId) => {
     pollerRef.current = setInterval(async () => {
       try {
-        const res = await axios.get(`http://localhost:8000/chat/status/${taskId}`);
+        const res = await axios.get(`${API}/chat/status/${taskId}`);
         const { status, result } = res.data;
         if (status === 'completed' || status === 'failed') {
           clearInterval(pollerRef.current);
@@ -778,7 +780,7 @@ export default function App() {
     setInput(''); setLoading(true); setSugg([]);
     if (taRef.current) taRef.current.style.height = 'auto';
     try {
-      const res = await axios.post('http://localhost:8000/chat', {
+      const res = await axios.post(`${API}/chat`, {
         message:txt, thread_id:threadId, is_continuation:true,
       });
       poll(res.data.task_id);
