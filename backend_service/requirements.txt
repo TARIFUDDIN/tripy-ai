@@ -1,0 +1,15 @@
+# Travel AI Backend — No LangGraph
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+httpx
+
+# LLM
+langchain-core
+langchain-google-genai
+
+# Flight APIs
+amadeus
+
+# (Optional) Hotelbeds uses httpx — already listed above
