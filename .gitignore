@@ -24,3 +24,6 @@ web_app/.env
 *.njsproj
 *.sln
 *.sw?
+.env
+backend_service/.env
+web_app/.env
