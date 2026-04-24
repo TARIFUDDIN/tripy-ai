@@ -39,34 +39,28 @@ app = FastAPI(
     description="Async multi-agent system for intelligent travel planning",
     version="2.4.0"
 )
-
 agent_graph = build_enhanced_graph()
-
 jobs:          Dict[str, Dict[str, Any]] = {}
 customer_data: Dict[str, Dict[str, Any]] = {}
-
 bookings_store: List[Dict[str, Any]] = []
 orders_store:   List[Dict[str, Any]] = []
-
 # ============================================================================
 # CORS
 # ============================================================================
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-    "https://tripy-ai.vercel.app"
+    "https://tripy-ai.vercel.app",
+    "https://tripy-ai-three.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ============================================================================
 # MODELS
 # ============================================================================
-
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     thread_id: str = Field(min_length=5)
@@ -165,13 +159,10 @@ def suggest_addons(booking: dict) -> dict:
     departure_time = booking.get("departure_time") or ""
     is_international = dest and dest not in _DOMESTIC_IATA
     is_gulf          = dest in _GULF_IATA
-
     suggestions: List[str] = []
     reasons:     Dict[str, str] = {}
-
     suggestions.append("lounge")
     reasons["lounge"] = "Recommended for all passengers — relax before your flight"
-
     if is_international:
         suggestions.append("esim")
         dest_city = booking.get("destination_city") or dest
@@ -279,13 +270,9 @@ async def run_agent_in_background(
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Travel AI Assistant", "version": "2.4.0"}
-
-
 @app.get("/health")
 def health():
     return {"status": "healthy"}
-
-
 @app.post("/chat", response_model=TaskResponse)
 async def start_chat_task(request: ChatRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
@@ -321,11 +308,9 @@ async def clear_thread(thread_id: str):
         return {"status": "cleared"}
     raise HTTPException(status_code=404, detail="Thread not found")
 
-
 # ============================================================================
 # PDF TICKET PARSING
 # ============================================================================
-
 @app.post("/ticket/parse")
 async def parse_ticket(file: UploadFile = File(...)):
     """
