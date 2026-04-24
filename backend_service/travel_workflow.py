@@ -22,7 +22,11 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage
 import httpx
-
+# travel_agent.py — add these 3 lines at the very top, before any imports
+import sys
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
@@ -1375,7 +1379,27 @@ async def search_flights(
         # Sort by user's price priority
         live_results.sort(key=lambda f: _score_flight(f, price_priority))
         return live_results[:6]
-
+    
+    if not DEMO_MODE and len(live_results) < 3:
+        try:
+            from browser_agent import scrape_google_flights
+            browser_results = await scrape_google_flights(
+                origin_iata, dest_iata, dep_date,
+                travel_class=tc, adults=adults, route_key=route_key,
+            )
+            # Run through your existing filters
+            validated = [
+                f for f in browser_results
+                if f.duration_minutes <= ROUTE_MAX_DURATION_MINUTES.get(route_key, 1200)
+                and _price_is_realistic(_to_float(f.price), route_key, tc)
+            ]
+            live_results = _dedup_flights(live_results + validated)
+            print(f"  Browser agent added {len(validated)} valid flights")
+        except Exception as e:
+            print(f"  ⚠️  Browser agent skipped: {e}")
+    if len(live_results) >= 3:
+       live_results.sort(key=lambda f: _score_flight(f, price_priority))
+       return live_results[:6]
     # Not enough live results — supplement with mock
     mock = _mock_flights(origin, destination, dep_date, tc, adults)
 
