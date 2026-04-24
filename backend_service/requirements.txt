@@ -7,3 +7,8 @@ Pillow
 pydantic
 langchain
 langchain-core
+langchain-community
+langchain-groq
+requests
+httpx
+aiohttp
