@@ -49,11 +49,7 @@ orders_store:   List[Dict[str, Any]] = []
 # ============================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-    "https://tripy-ai.vercel.app",
-    "https://tripy-ai-three.vercel.app"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
