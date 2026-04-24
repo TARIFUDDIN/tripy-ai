@@ -1,16 +1,20 @@
 """
-FastAPI Server v2.4 — Multi-Agent Travel Booking System
+FastAPI Server v2.5 — Multi-Agent Travel Booking System
 
-NEW in v2.4 (additions over v2.3):
-  - notify_chat_query()  — Telegram notification for chatbot itinerary/hotel/destination queries
-  - run_agent_in_background() now fires Telegram after every travel-related agent response
+NEW in v2.5 (additions over v2.4):
+  - ticket_normalizer.normalize_parsed_ticket() applied in /ticket/parse
+    so every OTA format (IndiGo, Air India, Emirates, MakeMyTrip, Cleartrip …)
+    maps to the same canonical field names the frontend expects.
+  - Passenger name noise stripped  ("Mr. Pavan Reddy From" → "Mr. Pavan Reddy")
+  - Dates normalised to ISO 8601 regardless of OTA format
+  - IATA ↔ City auto-fill (no more "Not found" when one side is present)
 """
+
 import sys
 if sys.platform == "win32":
     import asyncio
-    asyncio.set_event_loop_policy(
-        asyncio.WindowsSelectorEventLoopPolicy()
-    )
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -27,8 +31,11 @@ from langchain_core.messages import AIMessage as AI
 from travel_workflow import build_enhanced_graph
 from pdf_parser import parse_ticket_upload
 
-# ── v2.4: both notifiers imported ────────────────────────────────────────────
+# v2.4 notifiers
 from telegram_notifier import notify_booking_parsed, notify_chat_query
+
+# ── v2.5: field normalizer ────────────────────────────────────────────────────
+from ticket_normalizer import normalize_parsed_ticket
 
 # ============================================================================
 # APP INIT
@@ -37,13 +44,14 @@ from telegram_notifier import notify_booking_parsed, notify_chat_query
 app = FastAPI(
     title="Travel AI Assistant API",
     description="Async multi-agent system for intelligent travel planning",
-    version="2.4.0"
+    version="2.5.0",
 )
-agent_graph = build_enhanced_graph()
-jobs:          Dict[str, Dict[str, Any]] = {}
-customer_data: Dict[str, Dict[str, Any]] = {}
-bookings_store: List[Dict[str, Any]] = []
-orders_store:   List[Dict[str, Any]] = []
+agent_graph    = build_enhanced_graph()
+jobs:           Dict[str, Dict[str, Any]] = {}
+customer_data:  Dict[str, Dict[str, Any]] = {}
+bookings_store: List[Dict[str, Any]]      = []
+orders_store:   List[Dict[str, Any]]      = []
+
 # ============================================================================
 # CORS
 # ============================================================================
@@ -54,9 +62,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ============================================================================
 # MODELS
 # ============================================================================
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     thread_id: str = Field(min_length=5)
@@ -89,51 +99,11 @@ class AddonSelectRequest(BaseModel):
 # ============================================================================
 
 ADDONS_CATALOG = [
-    {
-        "id":          "lounge",
-        "name":        "Airport Lounge Access",
-        "description": "Relax in a premium lounge with food, Wi-Fi and shower",
-        "price":       25,
-        "commission":  10,
-        "icon":        "🛋️",
-        "popular":     True,
-    },
-    {
-        "id":          "esim",
-        "name":        "Travel eSIM (1 GB)",
-        "description": "Instant data in 100+ countries — no SIM swap needed",
-        "price":       10,
-        "commission":  4,
-        "icon":        "📶",
-        "popular":     True,
-    },
-    {
-        "id":          "insurance",
-        "name":        "Travel Insurance",
-        "description": "Medical, cancellation and baggage cover for the trip",
-        "price":       20,
-        "commission":  8,
-        "icon":        "🛡️",
-        "popular":     False,
-    },
-    {
-        "id":          "fast_track",
-        "name":        "Priority Security Fast-Track",
-        "description": "Skip the queue at departure security",
-        "price":       15,
-        "commission":  6,
-        "icon":        "⚡",
-        "popular":     False,
-    },
-    {
-        "id":          "transfer",
-        "name":        "Airport Transfer",
-        "description": "Pre-booked private car from airport to hotel",
-        "price":       35,
-        "commission":  12,
-        "icon":        "🚗",
-        "popular":     True,
-    },
+    {"id": "lounge",      "name": "Airport Lounge Access",         "description": "Relax in a premium lounge with food, Wi-Fi and shower",          "price": 25, "commission": 10, "icon": "🛋️",  "popular": True},
+    {"id": "esim",        "name": "Travel eSIM (1 GB)",            "description": "Instant data in 100+ countries — no SIM swap needed",             "price": 10, "commission": 4,  "icon": "📶",  "popular": True},
+    {"id": "insurance",   "name": "Travel Insurance",              "description": "Medical, cancellation and baggage cover for the trip",             "price": 20, "commission": 8,  "icon": "🛡️",  "popular": False},
+    {"id": "fast_track",  "name": "Priority Security Fast-Track",  "description": "Skip the queue at departure security",                            "price": 15, "commission": 6,  "icon": "⚡",   "popular": False},
+    {"id": "transfer",    "name": "Airport Transfer",              "description": "Pre-booked private car from airport to hotel",                    "price": 35, "commission": 12, "icon": "🚗",  "popular": True},
 ]
 
 # ============================================================================
@@ -141,13 +111,12 @@ ADDONS_CATALOG = [
 # ============================================================================
 
 _DOMESTIC_IATA = {
-    "BOM", "DEL", "BLR", "CCU", "MAA", "HYD", "GOI", "PNQ", "COK",
-    "AMD", "JAI", "IXJ", "SXR", "LKO", "VNS", "ATQ", "PAT", "GAU",
-    "IXR", "RPR", "NAG", "BHO", "IDR", "UDR", "JDH", "BBI", "VTZ",
-    "TRV", "CJB", "IXC",
+    "BOM","DEL","BLR","CCU","MAA","HYD","GOI","PNQ","COK",
+    "AMD","JAI","IXJ","SXR","LKO","VNS","ATQ","PAT","GAU",
+    "IXR","RPR","NAG","BHO","IDR","UDR","JDH","BBI","VTZ",
+    "TRV","CJB","IXC",
 }
-
-_GULF_IATA = {"DXB", "AUH", "DOH", "RUH", "MCT", "KWI"}
+_GULF_IATA = {"DXB","AUH","DOH","RUH","MCT","KWI"}
 
 
 def suggest_addons(booking: dict) -> dict:
@@ -157,13 +126,14 @@ def suggest_addons(booking: dict) -> dict:
     is_gulf          = dest in _GULF_IATA
     suggestions: List[str] = []
     reasons:     Dict[str, str] = {}
+
     suggestions.append("lounge")
     reasons["lounge"] = "Recommended for all passengers — relax before your flight"
+
     if is_international:
         suggestions.append("esim")
         dest_city = booking.get("destination_city") or dest
-        reasons["esim"] = f"Traveling to {dest_city} — stay connected without a local SIM"
-
+        reasons["esim"]      = f"Traveling to {dest_city} — stay connected without a local SIM"
         suggestions.append("insurance")
         reasons["insurance"] = "International trip — covers medical emergencies and cancellations"
 
@@ -180,8 +150,7 @@ def suggest_addons(booking: dict) -> dict:
     except (ValueError, IndexError):
         pass
 
-    seen   = set()
-    unique: List[str] = []
+    seen, unique = set(), []
     for s in suggestions:
         if s not in seen:
             seen.add(s)
@@ -191,25 +160,22 @@ def suggest_addons(booking: dict) -> dict:
 
 
 # ============================================================================
-# BACKGROUND TASK  ── v2.4: fires notify_chat_query after agent completes
+# BACKGROUND TASK
 # ============================================================================
 
 async def run_agent_in_background(
     task_id: str,
     thread_id: str,
     message: str,
-    is_continuation: bool = False
+    is_continuation: bool = False,
 ):
     print(f"→ Task {task_id} started | thread={thread_id}")
-
     try:
         config = {"configurable": {"thread_id": thread_id}}
-
-        state = {
+        state  = {
             "messages":        [HumanMessage(content=message)],
             "is_continuation": is_continuation,
         }
-
         if thread_id in customer_data:
             state["customer_info"] = customer_data[thread_id]
             state["current_step"]  = "info_collected"
@@ -229,18 +195,14 @@ async def run_agent_in_background(
             "result": {
                 "reply":           reply,
                 "structured_data": final_state.get("structured_data"),
-            }
+            },
         }
-
         if final_state.get("form_to_display"):
             response["form_to_display"] = final_state["form_to_display"]
 
         jobs[task_id] = response
         print(f"✓ Task {task_id} completed")
 
-        # ── v2.4: fire Telegram for flight / hotel / destination queries ──────
-        # Non-blocking — runs after the job is already stored so it never
-        # delays the frontend polling for a result.
         asyncio.create_task(
             notify_chat_query(
                 thread_id=thread_id,
@@ -252,36 +214,31 @@ async def run_agent_in_background(
 
     except Exception as e:
         traceback.print_exc()
-        jobs[task_id] = {
-            "status": "failed",
-            "result": {"error": str(e)}
-        }
+        jobs[task_id] = {"status": "failed", "result": {"error": str(e)}}
         print(f"✗ Task {task_id} failed: {e}")
 
 
 # ============================================================================
-# ROUTES
+# ROUTES — chat
 # ============================================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Travel AI Assistant", "version": "2.4.0"}
+    return {"status": "ok", "service": "Travel AI Assistant", "version": "2.5.0"}
+
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
 @app.post("/chat", response_model=TaskResponse)
 async def start_chat_task(request: ChatRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
     jobs[task_id] = {"status": "running"}
     background_tasks.add_task(
         run_agent_in_background,
-        task_id,
-        request.thread_id,
-        request.message,
-        request.is_continuation
+        task_id, request.thread_id, request.message, request.is_continuation,
     )
     return TaskResponse(task_id=task_id)
-
 
 @app.get("/chat/status/{task_id}", response_model=StatusResponse)
 async def get_status(task_id: str):
@@ -290,12 +247,10 @@ async def get_status(task_id: str):
         raise HTTPException(status_code=404, detail="Task not found")
     return StatusResponse(**job)
 
-
 @app.post("/chat/customer-info")
 async def save_customer_info(request: CustomerInfoRequest):
     customer_data[request.thread_id] = request.customer_info
     return {"status": "stored", "message": "Customer info saved"}
-
 
 @app.delete("/chat/thread/{thread_id}")
 async def clear_thread(thread_id: str):
@@ -304,40 +259,57 @@ async def clear_thread(thread_id: str):
         return {"status": "cleared"}
     raise HTTPException(status_code=404, detail="Thread not found")
 
+
 # ============================================================================
-# PDF TICKET PARSING
+# PDF TICKET PARSING  ── v2.5: normalizer applied here
 # ============================================================================
+
 @app.post("/ticket/parse")
 async def parse_ticket(file: UploadFile = File(...)):
     """
     Upload a flight ticket PDF/image.
-    v2.3: smart add-on suggestions + Telegram notification with booking deep-link.
+    v2.5: raw pdf_parser output is normalised through normalize_parsed_ticket()
+          so every OTA's field naming is mapped to a single canonical schema.
     """
-    ALLOWED_EXTENSIONS = {'.pdf', '.jpg', '.jpeg', '.png', '.webp', '.bmp'}
-    ext = '.' + file.filename.rsplit('.', 1)[-1].lower() if file.filename and '.' in file.filename else ''
+    ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    ext = (
+        "." + file.filename.rsplit(".", 1)[-1].lower()
+        if file.filename and "." in file.filename
+        else ""
+    )
     if not ext or ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Upload PDF, JPG, or PNG.")
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Upload PDF, JPG, or PNG.",
+        )
 
-    result = await parse_ticket_upload(file)
+    raw_result = await parse_ticket_upload(file)
 
-    if "error" in result:
-        raise HTTPException(status_code=422, detail=result["error"])
+    if "error" in raw_result:
+        raise HTTPException(status_code=422, detail=raw_result["error"])
+
+    # ── v2.5: NORMALISE ──────────────────────────────────────────────────────
+    result = normalize_parsed_ticket(raw_result)
+    # Keep original raw data accessible for debugging
+    result["_raw"] = raw_result
+    # ─────────────────────────────────────────────────────────────────────────
 
     booking_id = str(uuid.uuid4())[:8].upper()
     booking = {
         "id":               booking_id,
         "source":           "pdf_upload",
         "created_at":       datetime.utcnow().isoformat(),
-        "name":             result.get("name")             or "Syed Tarifuddin Ahmed",
-        "pnr":              result.get("pnr")              or "X89DQE",
-        "flight_number":    result.get("flight_number")    or "6E-2045",
-        "origin":           result.get("origin")           or "BOM",
-        "destination":      result.get("destination")      or "LHR",
-        "origin_city":      result.get("origin_city")      or "Mumbai",
-        "destination_city": result.get("destination_city") or "London",
-        "departure_date":   result.get("departure_date")   or "2026-04-25",
-        "departure_time":   result.get("departure_time")   or "07:15",
-        "confidence":       result.get("confidence", 0),
+        # Use normalised values; fall back only if normaliser returned None
+        "name":             result.get("name")             or "Unknown Passenger",
+        "pnr":              result.get("pnr")              or "UNKNOWN",
+        "flight_number":    result.get("flight_number")    or "UNKNOWN",
+        "origin":           result.get("origin")           or "UNK",
+        "destination":      result.get("destination")      or "UNK",
+        "origin_city":      result.get("origin_city")      or result.get("origin") or "Unknown",
+        "destination_city": result.get("destination_city") or result.get("destination") or "Unknown",
+        "departure_date":   result.get("departure_date")   or "",
+        "departure_time":   result.get("departure_time")   or "",
+        "confidence":       result.get("confidence", 0.0),
         "status":           "confirmed",
         "addons":           [],
         "commission_earned": 0,
@@ -349,13 +321,14 @@ async def parse_ticket(file: UploadFile = File(...)):
 
     bookings_store.append(booking)
 
-    asyncio.create_task(
-        notify_booking_parsed(booking, ADDONS_CATALOG)
-    )
+    asyncio.create_task(notify_booking_parsed(booking, ADDONS_CATALOG))
+
+    # Strip internal debug key from API response
+    result_for_response = {k: v for k, v in result.items() if k != "_raw"}
 
     return {
         "booking_id": booking_id,
-        "parsed":     result,
+        "parsed":     result_for_response,
         "booking":    booking,
         "suggested_addons": [
             {
@@ -386,7 +359,6 @@ async def get_booking(booking_id: str):
     booking = next((b for b in bookings_store if b["id"] == booking_id), None)
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-
     suggested_full = [
         {
             **next((a for a in ADDONS_CATALOG if a["id"] == aid), {"id": aid}),
@@ -394,7 +366,6 @@ async def get_booking(booking_id: str):
         }
         for aid in booking.get("suggested_addons", [])
     ]
-
     return {**booking, "suggested_addons_full": suggested_full}
 
 
@@ -410,7 +381,6 @@ async def get_addons():
 @app.post("/addons/select")
 async def select_addons(request: AddonSelectRequest):
     selected = [a for a in ADDONS_CATALOG if a["id"] in request.addon_ids]
-
     if not selected:
         raise HTTPException(status_code=400, detail="No valid add-on IDs provided")
 
@@ -439,7 +409,7 @@ async def select_addons(request: AddonSelectRequest):
     links = [
         {
             **a,
-            "link": f"{BASE_URL}/addon/{a['id']}?booking={request.booking_id}&order={order_id}"
+            "link": f"{BASE_URL}/addon/{a['id']}?booking={request.booking_id}&order={order_id}",
         }
         for a in selected
     ]
@@ -461,7 +431,6 @@ async def select_addons(request: AddonSelectRequest):
 async def dashboard_stats():
     total_bookings = len(bookings_store)
     total_orders   = len(orders_store)
-
     total_revenue    = sum(o["total_price"]      for o in orders_store)
     total_commission = sum(o["total_commission"] for o in orders_store)
 
@@ -477,7 +446,6 @@ async def dashboard_stats():
         round(bookings_with_addons / total_bookings * 100, 1)
         if total_bookings > 0 else 0.0
     )
-
     recent = sorted(bookings_store, key=lambda b: b["created_at"], reverse=True)[:5]
 
     return {
@@ -492,7 +460,7 @@ async def dashboard_stats():
             "revenue_numeric":    total_revenue,
             "commission_numeric": total_commission,
             "bookings_numeric":   total_bookings,
-        }
+        },
     }
 
 
@@ -502,14 +470,14 @@ async def dashboard_stats():
 
 @app.on_event("startup")
 async def startup():
-    print("\n🚀 Travel AI Server v2.4 Started")
-    print("  ✅ /ticket/parse        — PDF upload + smart add-on suggestions + Telegram")
+    print("\n🚀 Travel AI Server v2.5 Started")
+    print("  ✅ /ticket/parse        — PDF upload + field normalizer + smart add-ons + Telegram")
     print("  ✅ /chat                — chatbot queries + Telegram on itinerary results")
     print("  ✅ /addons              — add-ons catalog")
     print("  ✅ /addons/select       — commission engine")
     print("  ✅ /bookings/:id        — booking detail page (Telegram deep-link)")
     print("  ✅ /dashboard/stats     — agent stats")
-    print("  ✅ Telegram notify      — fires on PDF parse AND chatbot itinerary results\n")
+    print("  ✅ ticket_normalizer    — OTA field-name aliasing + date/IATA normalisation\n")
 
 
 @app.on_event("shutdown")

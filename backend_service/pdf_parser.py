@@ -19,7 +19,6 @@ Key fixes vs v5:
   - FIX #10: "Booking reference no (PNR)" label (Air India style) added to PNR
              label patterns so JBT5M is captured correctly.
 """
-
 import re
 import os
 import io
@@ -49,14 +48,10 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
     print("⚠️  Pillow not installed — run: pip install Pillow")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "")
-
 SUPPORTED_IMAGE_TYPES = {
     '.jpg':  'image/jpeg',
     '.jpeg': 'image/jpeg',
@@ -65,12 +60,9 @@ SUPPORTED_IMAGE_TYPES = {
     '.gif':  'image/gif',
     '.bmp':  'image/bmp',
 }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-
 IATA_TO_CITY: Dict[str, str] = {
     "BOM": "Mumbai",        "DEL": "Delhi",         "BLR": "Bangalore",
     "CCU": "Kolkata",       "MAA": "Chennai",        "HYD": "Hyderabad",
@@ -155,7 +147,51 @@ BRAND_SKIP = {
     "indigo", "spicejet", "vistara", "airindia", "akasa",
     "emirates", "etihad", "flydubai",
 }
+# ── FIX #11: Labeled-city helpers for interleaved-column boarding passes ──────
+_FROM_TO_STOP = r'(?:To|From|Flight|Date|Boarding|PNR|Name|Flt|Seat|Seq|Gate|Class|Departure|Arrival|Sequence)'
 
+# REPLACE the entire _labeled_city function with this:
+
+def _labeled_city(text: str, label: str, city_to_iata_map: dict) -> Optional[str]:
+    """
+    Extract city name after a 'From :' or 'To :' label.
+    Handles pdfplumber interleaved-column output and single-space separation.
+    """
+    # Strategy 1: end-of-line — highest priority
+    p_eol = rf'(?:^|\s){label}\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t]+[A-Za-z]+)*)[ \t]*(?:\n|$)'
+    for m in re.finditer(p_eol, text, re.IGNORECASE | re.MULTILINE):
+        city = m.group(1).strip()
+        if city.lower() in city_to_iata_map:
+            return city
+
+    # Strategy 2: inline before another label keyword (relaxed spacing: 1+ spaces)
+    # FIX: Changed \s+ to allow single space before stop word (was requiring \s{2,})
+    _stop_rx = rf'(?:{_FROM_TO_STOP})'
+    p_inline = rf'\b{label}\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t]+[A-Za-z]+)*?)[ \t]+(?={_stop_rx}\s*[:\-# ])'
+    for m in re.finditer(p_inline, text, re.IGNORECASE | re.MULTILINE):
+        city = m.group(1).strip()
+        if city.lower() in city_to_iata_map:
+            return city
+
+    # Strategy 3: greedy grab to end of line then trim trailing junk
+    p_greedy = rf'\b{label}\s*[:\-]\s*([A-Z][a-zA-Z ]+?)(?:\s{{2,}}|\t|(?=\s+{_stop_rx})|\n|$)'
+    for m in re.finditer(p_greedy, text, re.IGNORECASE | re.MULTILINE):
+        city = m.group(1).strip()
+        if city.lower() in city_to_iata_map:
+            return city
+
+    return None
+
+def _city_str_to_iata(city: str, city_to_iata_map: dict) -> Optional[str]:
+    if not city:
+        return None
+    c = city.lower().strip()
+    if c in city_to_iata_map:
+        return city_to_iata_map[c]
+    for k, v in city_to_iata_map.items():
+        if k in c or c in k:
+            return v
+    return None
 # FIX #1: Field-label words that must terminate a passenger name match
 NAME_STOP_WORDS = (
     "From", "To", "Date", "Flight", "PNR", "Seat", "Gate",
@@ -211,12 +247,9 @@ def _detect_ota(text: str) -> str:
         if airline in tl:
             return 'airline'
     return 'unknown'
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # FIELD EXTRACTORS
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _is_valid_pnr(val: str) -> bool:
     """
     Strict PNR validation.
@@ -472,8 +505,46 @@ def _extract_airline_and_flight(text: str) -> Tuple[Optional[str], Optional[str]
 
 def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
     origin = destination = None
+    city_to_iata = {
+        re.sub(r'\s+', ' ', v.lower().strip()): k
+        for k, v in IATA_TO_CITY.items()
+    }
 
-    # ── Pass 1: IATA pair patterns ────────────────────────────────────────────
+    # ── Pass 0: FIX #11 — extract From/To as independent labeled fields ───────
+    # Handles pdfplumber interleaving columns (boarding pass table layout)
+    o_city_str = _labeled_city(text, "From", city_to_iata)
+    d_city_str = _labeled_city(text, "To",   city_to_iata)
+    if o_city_str:
+        origin      = _city_str_to_iata(o_city_str, city_to_iata)
+    if d_city_str:
+        destination = _city_str_to_iata(d_city_str, city_to_iata)
+    if origin and destination:
+        return origin, destination
+    # ── Pass 0.5: Full-line "From : CityName    To : CityName" on same line ──
+    # Handles pdfplumber output where both labels land on one line with spaces
+    same_line_pat = re.compile(
+        r'From\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t]+[A-Za-z]+)*)'
+        r'[ \t]+'
+        r'To\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t]+[A-Za-z]+)*)',
+        re.IGNORECASE
+    )
+    for m in same_line_pat.finditer(text):
+        o_city = re.sub(r'\s+', ' ', m.group(1).strip().lower())
+        d_city = re.sub(r'\s+', ' ', m.group(2).strip().lower())
+        _o = city_to_iata.get(o_city)
+        _d = city_to_iata.get(d_city)
+        # Partial match fallback
+        if not _o:
+            for k, v in city_to_iata.items():
+                if k in o_city or o_city in k:
+                    _o = v; break
+        if not _d:
+            for k, v in city_to_iata.items():
+                if k in d_city or d_city in k:
+                    _d = v; break
+        if _o and _d and _o != _d:
+            return _o, _d
+    # ─────────────────────────────────────────────────────────────────────────
     iata_pair_patterns = [
         r'\b([A-Z]{3})\s*[-–—→/]\s*([A-Z]{3})\b',
         r'From\s*[:\-]?\s*([A-Z]{3})\s+To\s*[:\-]?\s*([A-Z]{3})',
@@ -500,8 +571,11 @@ def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
 
     # ── Pass 3: City name → IATA lookup ──────────────────────────────────────
     city_pair_patterns = [
-        r'From\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)\s+To\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)(?:\n|$|\s{2,})',
-        r'(?:From|Departing)\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)\s+(?:To|Arriving)\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)(?:\n|$)',
+        # FIX: allow single-space termination (pdfplumber inline column output)
+        r'From\s*[:\-]?\s*([A-Z][a-zA-Z]+(?:\s[A-Za-z]+)*?)\s+To\s*[:\-]?\s*([A-Z][a-zA-Z]+(?:\s[A-Za-z]+)*)(?:\s{2,}|\t|\n|$)',
+        # Fallback: single-space before To is OK if followed by colon/dash
+        r'From\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t][A-Za-z]+)*?)[ \t]+To\s*[:\-]\s*([A-Z][a-zA-Z]+(?:[ \t][A-Za-z]+)*)',
+        r'(?:From|Departing)\s*[:\-]?\s*([A-Z][a-zA-Z\s]+?)\s+(?:To|Arriving)\s*[:\-]?\s*([A-Z][a-zA-Z\s]+?)(?:\n|$)',
         r'([A-Z][a-zA-Z\s]+?)\s*(?:→|to|TO)\s*([A-Z][a-zA-Z\s]+?)(?:\n|$|\s{2,})',
     ]
 
