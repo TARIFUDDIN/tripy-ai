@@ -1,14 +1,23 @@
 """
-pdf_parser.py — Flight Ticket PDF + Image Parser v3
+pdf_parser.py — Flight Ticket PDF + Image Parser v6
 Handles: Yatra, Air India, IndiGo, Emirates, Qatar, SpiceJet, MakeMyTrip, Cleartrip
 Image support: JPG, JPEG, PNG, WEBP, BMP via Google Cloud Vision API (free tier: 1000/month)
 
-Key fixes vs v2:
-  - Added Google Cloud Vision OCR for image tickets (JPG/PNG/WEBP)
-  - Universal upload handler auto-detects PDF vs image
-  - Image preprocessing (resize + compress) before Vision API call
-  - Zero heavy installs — only Pillow + requests needed for images
-  - .env support via GOOGLE_VISION_API_KEY environment variable
+Key fixes vs v5:
+  - FIX #6: PNR pattern now matches "Booking reference no (PNR): JBT5M (AI)" —
+             parenthesised suffix like "(AI)" is consumed so it never bleeds into value.
+  - FIX #7: Name "MR DHANANJAY PAWAR" no longer appends "AI" from trailing ticket-number
+             line.  The ALL-CAPS slash pattern now strips everything after the value
+             including any trailing "(AI)" or standalone two-letter suffix.
+  - FIX #8: Origin / Destination: "NA" is now explicitly in SKIP_IATA so the table
+             header row "NA – NA" is skipped; also IATA pair scan now skips rows where
+             both codes are identical or where either is in SKIP_IATA.
+  - FIX #9: Departure date: Added "Issued date" / "Issue date" / "Issued on" as a
+             suppressed prefix so those dates are never returned as the travel date.
+             Travel-date patterns are tried first; issue-date is stripped from the
+             candidate text before fallback date extraction runs.
+  - FIX #10: "Booking reference no (PNR)" label (Air India style) added to PNR
+             label patterns so JBT5M is captured correctly.
 """
 
 import re
@@ -23,7 +32,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  
+    pass
 
 # ── pdfplumber (PDF parsing) ──────────────────────────────────────────────────
 try:
@@ -63,58 +72,67 @@ SUPPORTED_IMAGE_TYPES = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 IATA_TO_CITY: Dict[str, str] = {
-    "BOM": "Mumbai",       "DEL": "Delhi",        "BLR": "Bangalore",
-    "CCU": "Kolkata",      "MAA": "Chennai",       "HYD": "Hyderabad",
-    "GOI": "Goa",          "PNQ": "Pune",          "COK": "Kochi",
-    "AMD": "Ahmedabad",    "JAI": "Jaipur",        "IXJ": "Jammu",
-    "SXR": "Srinagar",     "LKO": "Lucknow",       "VNS": "Varanasi",
-    "ATQ": "Amritsar",     "PAT": "Patna",         "GAU": "Guwahati",
-    "IXR": "Ranchi",       "RPR": "Raipur",        "NAG": "Nagpur",
-    "BHO": "Bhopal",       "IDR": "Indore",        "UDR": "Udaipur",
-    "JDH": "Jodhpur",      "BBI": "Bhubaneswar",   "VTZ": "Visakhapatnam",
-    "TRV": "Trivandrum",   "CJB": "Coimbatore",    "IXC": "Chandigarh",
-    "DXB": "Dubai",        "AUH": "Abu Dhabi",     "DOH": "Doha",
-    "RUH": "Riyadh",       "MCT": "Muscat",        "KWI": "Kuwait",
-    "SIN": "Singapore",    "BKK": "Bangkok",       "KUL": "Kuala Lumpur",
-    "DPS": "Bali",         "HKT": "Phuket",        "CGK": "Jakarta",
-    "MNL": "Manila",       "SGN": "Ho Chi Minh",   "HAN": "Hanoi",
-    "NRT": "Tokyo",        "KIX": "Osaka",         "ICN": "Seoul",
-    "PEK": "Beijing",      "PVG": "Shanghai",      "HKG": "Hong Kong",
+    "BOM": "Mumbai",        "DEL": "Delhi",         "BLR": "Bangalore",
+    "CCU": "Kolkata",       "MAA": "Chennai",        "HYD": "Hyderabad",
+    "GOI": "Goa",           "PNQ": "Pune",           "COK": "Kochi",
+    "AMD": "Ahmedabad",     "JAI": "Jaipur",         "IXJ": "Jammu",
+    "SXR": "Srinagar",      "LKO": "Lucknow",        "VNS": "Varanasi",
+    "ATQ": "Amritsar",      "PAT": "Patna",          "GAU": "Guwahati",
+    "IXR": "Ranchi",        "RPR": "Raipur",         "NAG": "Nagpur",
+    "BHO": "Bhopal",        "IDR": "Indore",         "UDR": "Udaipur",
+    "JDH": "Jodhpur",       "BBI": "Bhubaneswar",
+    "VTZ": "Visakhapatnam",
+    "TRV": "Trivandrum",    "CJB": "Coimbatore",     "IXC": "Chandigarh",
+    "DXB": "Dubai",         "AUH": "Abu Dhabi",      "DOH": "Doha",
+    "RUH": "Riyadh",        "MCT": "Muscat",         "KWI": "Kuwait",
+    "SIN": "Singapore",     "BKK": "Bangkok",        "KUL": "Kuala Lumpur",
+    "DPS": "Bali",          "HKT": "Phuket",         "CGK": "Jakarta",
+    "MNL": "Manila",        "SGN": "Ho Chi Minh",    "HAN": "Hanoi",
+    "NRT": "Tokyo",         "KIX": "Osaka",          "ICN": "Seoul",
+    "PEK": "Beijing",       "PVG": "Shanghai",       "HKG": "Hong Kong",
     "TPE": "Taipei",
-    "LHR": "London",       "CDG": "Paris",         "FRA": "Frankfurt",
-    "AMS": "Amsterdam",    "FCO": "Rome",          "MAD": "Madrid",
-    "BCN": "Barcelona",    "ZRH": "Zurich",        "VIE": "Vienna",
-    "IST": "Istanbul",     "ATH": "Athens",        "MUC": "Munich",
-    "BER": "Berlin",       "PRG": "Prague",        "WAW": "Warsaw",
-    "LIS": "Lisbon",       "DUB": "Dublin",
-    "JFK": "New York",     "LAX": "Los Angeles",   "ORD": "Chicago",
-    "MIA": "Miami",        "SFO": "San Francisco", "BOS": "Boston",
-    "ATL": "Atlanta",      "DFW": "Dallas",        "SEA": "Seattle",
-    "YYZ": "Toronto",      "YVR": "Vancouver",
-    "SYD": "Sydney",       "MEL": "Melbourne",     "BNE": "Brisbane",
-    "JNB": "Johannesburg", "CPT": "Cape Town",     "NBO": "Nairobi",
+    "LHR": "London",        "CDG": "Paris",          "FRA": "Frankfurt",
+    "AMS": "Amsterdam",     "FCO": "Rome",           "MAD": "Madrid",
+    "BCN": "Barcelona",     "ZRH": "Zurich",         "VIE": "Vienna",
+    "IST": "Istanbul",      "ATH": "Athens",         "MUC": "Munich",
+    "BER": "Berlin",        "PRG": "Prague",         "WAW": "Warsaw",
+    "LIS": "Lisbon",        "DUB": "Dublin",
+    "JFK": "New York",      "LAX": "Los Angeles",    "ORD": "Chicago",
+    "MIA": "Miami",         "SFO": "San Francisco",  "BOS": "Boston",
+    "ATL": "Atlanta",       "DFW": "Dallas",         "SEA": "Seattle",
+    "YYZ": "Toronto",       "YVR": "Vancouver",
+    "SYD": "Sydney",        "MEL": "Melbourne",      "BNE": "Brisbane",
+    "JNB": "Johannesburg",  "CPT": "Cape Town",      "NBO": "Nairobi",
     "CAI": "Cairo",
 }
 
 AIRLINE_CODES: Dict[str, str] = {
-    "AI": "Air India",      "6E": "IndiGo",         "SG": "SpiceJet",
-    "UK": "Vistara",        "QP": "Akasa Air",      "G8": "Go First",
-    "I5": "AirAsia India",  "EK": "Emirates",       "QR": "Qatar Airways",
-    "EY": "Etihad",         "FZ": "Flydubai",       "G9": "Air Arabia",
-    "WY": "Oman Air",       "SQ": "Singapore Airlines", "TG": "Thai Airways",
-    "AK": "AirAsia",        "MH": "Malaysia Airlines",  "VN": "Vietnam Airlines",
-    "CX": "Cathay Pacific", "JL": "Japan Airlines", "NH": "ANA",
-    "KE": "Korean Air",     "BA": "British Airways","LH": "Lufthansa",
-    "AF": "Air France",     "KL": "KLM",            "TK": "Turkish Airlines",
-    "VS": "Virgin Atlantic","LX": "SWISS",          "IB": "Iberia",
-    "DL": "Delta",          "UA": "United Airlines","AA": "American Airlines",
-    "QF": "Qantas",         "ET": "Ethiopian Airlines", "MS": "EgyptAir",
+    "AI": "Air India",       "6E": "IndiGo",          "SG": "SpiceJet",
+    "UK": "Vistara",         "QP": "Akasa Air",       "G8": "Go First",
+    "I5": "AirAsia India",   "EK": "Emirates",        "QR": "Qatar Airways",
+    "EY": "Etihad",          "FZ": "Flydubai",        "G9": "Air Arabia",
+    "WY": "Oman Air",        "SQ": "Singapore Airlines", "TG": "Thai Airways",
+    "AK": "AirAsia",         "MH": "Malaysia Airlines",  "VN": "Vietnam Airlines",
+    "CX": "Cathay Pacific",  "JL": "Japan Airlines",  "NH": "ANA",
+    "KE": "Korean Air",      "BA": "British Airways", "LH": "Lufthansa",
+    "AF": "Air France",      "KL": "KLM",             "TK": "Turkish Airlines",
+    "VS": "Virgin Atlantic", "LX": "SWISS",           "IB": "Iberia",
+    "DL": "Delta",           "UA": "United Airlines", "AA": "American Airlines",
+    "QF": "Qantas",          "ET": "Ethiopian Airlines", "MS": "EgyptAir",
 }
 
 # Known OTA reference number patterns to SKIP (not real PNRs)
-OTA_REF_PATTERN = re.compile(r'^\d{8,}$')
+OTA_REF_PATTERN = re.compile(r'^\d{8,}$|^NF\d{6,}$', re.IGNORECASE)
 
-# English stopwords often misidentified as IATA codes
+# Words that must never be treated as PNR values
+PNR_SKIP_WORDS = {
+    "NUMBER", "BOOKING", "REFERENCE", "CONFIRM", "DETAILS", "TICKET",
+    "FLIGHT", "ITINERARY", "PASSENGER", "TRAVELLER", "RECEIPT", "ETICKET",
+    "INVOICE", "SUMMARY", "STATUS", "CONTACT", "SUPPORT", "CANCELLATION",
+}
+
+# English stopwords / non-IATA codes
+# FIX #8: Added "NA" explicitly so table header "NA" cells are always skipped
 SKIP_IATA = {
     "THE", "ARE", "FOR", "AND", "BUT", "NOT", "YOU", "ALL", "CAN",
     "HER", "WAS", "ONE", "OUR", "OUT", "WHO", "ITS", "HAS", "HAD",
@@ -124,7 +142,38 @@ SKIP_IATA = {
     "INR", "USD", "EUR", "GBP", "TAX", "VAT", "GST", "TDS", "NET",
     "NAT", "NON", "PRE", "PRO", "PER", "SUB", "SUM", "TAB", "TOP",
     "AIR", "FLY", "JET", "SKY", "VIA", "WEB", "YES", "AGE", "AGO",
+    "MMT", "NRI", "DOM", "SAT", "FRI", "MON", "TUE", "WED", "THU",
+    "SUN", "ADT", "CHD", "INF", "PAX", "DEP", "ARR", "DUR",
+    "NON", "STOP", "HRS",
+    # FIX #8: "NA" is a table filler, never a real IATA code
+    "NA", "N/A",
 }
+
+# Brand/company names that must never be matched as city or destination
+BRAND_SKIP = {
+    "makemytrip", "yatra", "cleartrip", "ixigo", "goibibo",
+    "indigo", "spicejet", "vistara", "airindia", "akasa",
+    "emirates", "etihad", "flydubai",
+}
+
+# FIX #1: Field-label words that must terminate a passenger name match
+NAME_STOP_WORDS = (
+    "From", "To", "Date", "Flight", "PNR", "Seat", "Gate",
+    "Board", "Depart", "Arriv", "Class", "Seq", "Time", "No",
+    "Booking", "Ticket", "E-Ticket", "Status", "Ref",
+)
+
+# FIX #9: Patterns for dates that are ISSUE/BOOKING dates, not travel dates.
+# We strip lines matching these before falling back to generic date extraction.
+ISSUE_DATE_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r'(?:Issued?|Issue)\s*(?:date|on|:)\s*[\w,\s]+\d{4}',
+        r'Booking\s*Date\s*[-:\s]+[\w,\s]+\d{4}',
+        r'Purchase\s*Date\s*[-:\s]+[\w,\s]+\d{4}',
+        r'Date\s*of\s*Issue\s*[-:\s]+[\w,\s]+\d{4}',
+    ]
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,19 +217,62 @@ def _detect_ota(text: str) -> str:
 # FIELD EXTRACTORS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_valid_pnr(val: str) -> bool:
+    """
+    Strict PNR validation.
+    - Must be 5-8 chars, start with a letter
+    - Must not be a known label word
+    - Must not match OTA booking ID pattern
+    - Must contain at least one letter (not all digits)
+    """
+    val = val.strip().upper()
+    if not val:
+        return False
+    if OTA_REF_PATTERN.match(val):
+        return False
+    if val in SKIP_IATA:
+        return False
+    if val in PNR_SKIP_WORDS:
+        return False
+    if not re.match(r'^[A-Z]', val):
+        return False
+    if not re.search(r'[A-Z]', val):
+        return False
+    if len(val) < 5 or len(val) > 8:
+        return False
+    return True
+
+
 def _extract_pnr(text: str, ota: str) -> Optional[str]:
+    # "Airline PNR" column label — strongest signal (MakeMyTrip table format)
+    airline_pnr_pattern = re.compile(
+        r'Airline\s*PNR\s*[:\-\|]?\s*([A-Z0-9]{5,8})\b',
+        re.IGNORECASE
+    )
+    m = airline_pnr_pattern.search(text)
+    if m:
+        val = m.group(1).strip().upper()
+        if _is_valid_pnr(val):
+            return val
+
+    # Standard PNR label patterns
+    # FIX #10: Added Air India style "Booking reference no (PNR):" pattern.
+    # The (?:\s*\([^)]*\))? suffix consumes optional trailing "(AI)" etc.
     pnr_label_patterns = [
+        # Air India: "Booking reference no (PNR): JBT5M (AI)"
+        r'Booking\s+reference\s+no\s*\(PNR\)\s*[:\-]?\s*([A-Z][A-Z0-9]{4,7})\b(?:\s*\([^)]{1,10}\))?',
         r'PNR\s*\n\s*([A-Z0-9]{5,8})\b',
-        r'PNR\s*[:\-\|]?\s*([A-Z][A-Z0-9]{4,7})\b',
+        r'\bPNR\s*[:\-\|]\s*([A-Z][A-Z0-9]{4,7})\b',
         r'PNR\s*/\s*Booking\s*Ref[:\s]+([A-Z][A-Z0-9]{4,7})\b',
     ]
     for p in pnr_label_patterns:
         m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
         if m:
             val = m.group(1).strip().upper()
-            if not OTA_REF_PATTERN.match(val) and val not in SKIP_IATA:
+            if _is_valid_pnr(val):
                 return val
 
+    # Booking reference patterns
     booking_ref_patterns = [
         r'(?:Booking\s*(?:Ref(?:erence)?|Code)|Record\s*Locator|Confirmation\s*(?:Code|No\.?))\s*[:\-]?\s*([A-Z][A-Z0-9]{4,7})\b',
         r'Reference\s*(?:No\.?|Number)?\s*[:\-]?\s*([A-Z][A-Z0-9]{4,7})\b',
@@ -189,16 +281,13 @@ def _extract_pnr(text: str, ota: str) -> Optional[str]:
         m = re.search(p, text, re.IGNORECASE)
         if m:
             val = m.group(1).strip().upper()
-            if not OTA_REF_PATTERN.match(val) and val not in SKIP_IATA:
+            if _is_valid_pnr(val):
                 return val
 
+    # Last resort: scan for 6-char alphanumeric tokens with mixed letters+digits
     candidates = re.findall(r'\b([A-Z][A-Z0-9]{5})\b', text)
     for c in candidates:
-        if OTA_REF_PATTERN.match(c):
-            continue
-        if c in SKIP_IATA:
-            continue
-        if re.search(r'\d', c):
+        if _is_valid_pnr(c) and re.search(r'\d', c) and re.search(r'[A-Z]', c):
             return c
 
     return None
@@ -207,9 +296,15 @@ def _extract_pnr(text: str, ota: str) -> Optional[str]:
 def _extract_name(text: str, ota: str) -> Optional[str]:
     name = None
 
+    # Build lookahead that stops at field-label words
+    _stop = '|'.join(NAME_STOP_WORDS)
+    _stop_lookahead = rf'(?=\s*\n|\s{{2,}}|\s+(?:{_stop})\b|[:\|]|$)'
+
+    # ── Priority 1: Title-based (Mr/Mrs/Ms/Dr etc.) ──────────────────────────
     title_pattern = re.compile(
-        r'\b(Mr\.?|Mrs\.?|Ms\.?|Miss\.?|Dr\.?|Shri|Smt)\s+'
-        r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,3})',
+        rf'\b(Mr\.?|Mrs\.?|Ms\.?|Miss\.?|Dr\.?|Shri|Smt)\s+'
+        rf'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){{1,3}}?)'
+        rf'{_stop_lookahead}',
         re.IGNORECASE
     )
     m = title_pattern.search(text)
@@ -217,9 +312,25 @@ def _extract_name(text: str, ota: str) -> Optional[str]:
         name = f"{m.group(1).rstrip('.')}. {m.group(2).strip()}"
         name = re.sub(r'\s+', ' ', name).strip()
 
+    # ── Priority 2: Explicit "Name :" label (IndiGo boarding pass style) ─────
+    if not name:
+        name_label_pattern = re.compile(
+            r'(?:^|\n)\s*Name\s*[:\-]\s*([A-Z][A-Za-z\s\.]{3,40})',
+            re.IGNORECASE | re.MULTILINE
+        )
+        m = name_label_pattern.search(text)
+        if m:
+            candidate = m.group(1).strip()
+            candidate = re.sub(
+                r'\s+(?:' + _stop + r')\b.*$', '', candidate, flags=re.IGNORECASE
+            ).strip()
+            if len(candidate) > 4:
+                name = candidate
+
+    # ── Priority 3: Explicit passenger label ─────────────────────────────────
     if not name:
         pax_patterns = [
-            r'Passenger(?:\s*Name)?\s*[:\-]\s*([A-Z][A-Za-z\s/\.]{3,40})',
+            r'Passenger(?:\s*Name)?\s*[:\-]\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3})',
             r'PAX(?:\s*Name)?\s*[:\-]\s*([A-Z][A-Za-z\s/\.]{3,40})',
             r'Travelling\s*as\s*[:\-]\s*([A-Z][A-Za-z\s/\.]{3,40})',
         ]
@@ -229,6 +340,9 @@ def _extract_name(text: str, ota: str) -> Optional[str]:
                 name = m.group(1).strip()
                 break
 
+    # ── Priority 4: ALL-CAPS surname/firstname format (airline direct tickets) ─
+    # FIX #7: Strip trailing two-letter airline suffixes like "(AI)" or bare "AI"
+    # that can appear on the same line as the passenger name on Air India tickets.
     if not name:
         caps_patterns = [
             r'NAME\s*[:\-]?\s*([A-Z]{2,20}/[A-Z]{2,20}(?:\s+MR|MRS|MS)?)',
@@ -240,21 +354,50 @@ def _extract_name(text: str, ota: str) -> Optional[str]:
                 if '/' in m.group(0):
                     parts = m.group(0).split('/')
                     surname = parts[0].strip().title()
-                    firstname = re.sub(r'\s*(MR|MRS|MS|MISS).*$', '', parts[1], flags=re.IGNORECASE).strip().title()
+                    firstname = re.sub(
+                        r'\s*(MR|MRS|MS|MISS).*$', '', parts[1], flags=re.IGNORECASE
+                    ).strip().title()
                     name = f"{firstname} {surname}"
                 else:
                     name = m.group(1).title()
                 break
 
+    # ── Priority 5: "Dear FirstName LastName" greeting ───────────────────────
     if not name:
         m = re.search(r'Dear\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text)
         if m:
             name = m.group(1).strip()
 
+    # ── Priority 6: MakeMyTrip table format ──────────────────────────────────
+    if not name:
+        mmt_name_patterns = [
+            r'(?:Passenger Name|Name)\s*\n\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*\n',
+            r'([A-Z][a-z]+\s+[A-Z][a-z]+)\s+(?:Adult|Child|Infant)\s+[A-Z0-9]{5,8}',
+        ]
+        for p in mmt_name_patterns:
+            m = re.search(p, text, re.MULTILINE)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate.lower() not in BRAND_SKIP and len(candidate) > 4:
+                    name = candidate
+                    break
+
+    # ── Final cleanup ─────────────────────────────────────────────────────────
     if name:
+        # Remove trailing label words and anything after them
+        name = re.sub(
+            rf'\s+(?:{_stop})\b.*$',
+            '', name, flags=re.IGNORECASE
+        ).strip()
         name = re.sub(
             r'\s*[\(\[].*$|'
             r'\s+(Adult|Child|Infant|Mr|Mrs|Ms)\b.*$',
+            '', name, flags=re.IGNORECASE
+        ).strip()
+        # FIX #7: Remove trailing standalone airline IATA codes like " AI", " EK" etc.
+        # that may appear after a name on the same text line (e.g. "DHANANJAY PAWAR AI")
+        name = re.sub(
+            r'\s+(?:' + '|'.join(AIRLINE_CODES.keys()) + r')\s*$',
             '', name, flags=re.IGNORECASE
         ).strip()
         name = re.sub(r'\s+', ' ', name)
@@ -274,8 +417,8 @@ def _extract_airline_and_flight(text: str) -> Tuple[Optional[str], Optional[str]
     airline_name_map = {
         'vistara':              'Vistara',
         'indigo':               'IndiGo',
-        'air india':            'Air India',
         'air india express':    'Air India Express',
+        'air india':            'Air India',
         'spicejet':             'SpiceJet',
         'go first':             'Go First',
         'goair':                'GoAir',
@@ -306,27 +449,22 @@ def _extract_airline_and_flight(text: str) -> Tuple[Optional[str], Optional[str]
             break
 
     flight_patterns = [
-        r'\b([A-Z]{1,2})\s*[-–]\s*(\d{2,4}[A-Z]?)\b',
-        r'(?:Flight|Flt|Flight\s*No\.?|Flight\s*Number)\s*[:\-]?\s*([A-Z]{1,2}[\s\-]?\d{2,4}[A-Z]?)',
-        r'\b([A-Z]{1,2})\s(\d{3,4}[A-Z]?)\b',
-        r'\b([A-Z]{1,2})(\d{3,4}[A-Z]?)\b',
+        (r'(?:Flt#?|Flight\s*No\.?)\s*[:\-]?\s*([A-Z0-9]{1,2})\s*[-–]?\s*(\d{2,4}[A-Z]?)\b', 2),
+        (r'\b([A-Z0-9]{1,2})\s*[-–]\s*(\d{2,4}[A-Z]?)\b', 2),
+        (r'\b(6E|AI|SG|UK|QP|G8|I5|EK|QR|EY|FZ|G9|WY|SQ|TG|AK|MH|VN|CX|JL|NH|KE|BA|LH|AF|KL|TK|VS|LX|IB|DL|UA|AA|QF|ET|MS)\s+(\d{3,4}[A-Z]?)\b', 2),
+        (r'\b([A-Z]{2})\s+(\d{3,4}[A-Z]?)\b', 2),
     ]
 
-    for p in flight_patterns:
-        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            if m.lastindex == 2:
-                code = m.group(1).upper()
-                num  = m.group(2).upper()
+    for p, ngroups in flight_patterns:
+        for m in re.finditer(p, text, re.IGNORECASE | re.MULTILINE):
+            code = m.group(1).upper().replace(' ', '').replace('-', '')
+            num  = m.group(2).upper()
+            if code in AIRLINE_CODES or re.match(r'^[A-Z]{2}$', code) or re.match(r'^[A-Z]\d$', code):
                 flight_number = f"{code}{num}"
                 if not airline_name and code in AIRLINE_CODES:
                     airline_name = AIRLINE_CODES[code]
-            else:
-                raw = re.sub(r'[\s\-]', '', m.group(1)).upper()
-                flight_number = raw
-                code = raw[:2]
-                if not airline_name and code in AIRLINE_CODES:
-                    airline_name = AIRLINE_CODES[code]
+                break
+        if flight_number:
             break
 
     return airline_name, flight_number
@@ -335,6 +473,7 @@ def _extract_airline_and_flight(text: str) -> Tuple[Optional[str], Optional[str]
 def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
     origin = destination = None
 
+    # ── Pass 1: IATA pair patterns ────────────────────────────────────────────
     iata_pair_patterns = [
         r'\b([A-Z]{3})\s*[-–—→/]\s*([A-Z]{3})\b',
         r'From\s*[:\-]?\s*([A-Z]{3})\s+To\s*[:\-]?\s*([A-Z]{3})',
@@ -344,6 +483,7 @@ def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
         for m in re.finditer(p, text, re.IGNORECASE | re.MULTILINE):
             o = m.group(1).upper()
             d = m.group(2).upper()
+            # FIX #8: skip if either code is in SKIP_IATA (covers "NA", "DEP", etc.)
             if o in SKIP_IATA or d in SKIP_IATA:
                 continue
             if o == d:
@@ -351,27 +491,43 @@ def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
             if o in IATA_TO_CITY or d in IATA_TO_CITY:
                 origin, destination = o, d
                 return origin, destination
-            if re.match(r'^[A-Z]{3}$', o) and re.match(r'^[A-Z]{3}$', d):
-                origin, destination = o, d
-                return origin, destination
 
+    # ── Pass 2: IATA codes in parentheses e.g. "Mumbai (BOM)" ─────────────────
+    iata_in_parens = re.findall(r'\(([A-Z]{3})\)', text)
+    valid_iata = [c for c in iata_in_parens if c in IATA_TO_CITY and c not in SKIP_IATA]
+    if len(valid_iata) >= 2:
+        return valid_iata[0], valid_iata[1]
+
+    # ── Pass 3: City name → IATA lookup ──────────────────────────────────────
     city_pair_patterns = [
+        r'From\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)\s+To\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)(?:\n|$|\s{2,})',
+        r'(?:From|Departing)\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)\s+(?:To|Arriving)\s*[\s:]+\s*([A-Z][a-zA-Z\s]+?)(?:\n|$)',
         r'([A-Z][a-zA-Z\s]+?)\s*(?:→|to|TO)\s*([A-Z][a-zA-Z\s]+?)(?:\n|$|\s{2,})',
-        r'(?:From|Departing)\s*[:\-]?\s*([A-Z][a-zA-Z\s]+?)\s+(?:To|Arriving)\s*[:\-]?\s*([A-Z][a-zA-Z\s]+?)(?:\n|$)',
     ]
-    city_to_iata = {v.lower(): k for k, v in IATA_TO_CITY.items()}
+
+    city_to_iata = {
+        re.sub(r'\s+', ' ', v.lower().strip()): k
+        for k, v in IATA_TO_CITY.items()
+    }
+
     for p in city_pair_patterns:
-        m = re.search(p, text, re.MULTILINE)
+        m = re.search(p, text, re.MULTILINE | re.IGNORECASE)
         if m:
-            o_city = m.group(1).strip().lower()
-            d_city = m.group(2).strip().lower()
+            o_city = re.sub(r'\s+', ' ', m.group(1).strip().lower())
+            d_city = re.sub(r'\s+', ' ', m.group(2).strip().lower())
+
+            if o_city in BRAND_SKIP or d_city in BRAND_SKIP:
+                continue
+
             for city, iata in city_to_iata.items():
                 if city in o_city and not origin:
                     origin = iata
                 if city in d_city and not destination:
                     destination = iata
+
             if origin and destination and origin != destination:
                 return origin, destination
+
             if not origin:
                 origin = m.group(1).strip()
             if not destination:
@@ -382,19 +538,55 @@ def _extract_route(text: str) -> Tuple[Optional[str], Optional[str]]:
     return origin, destination
 
 
+def _strip_issue_dates(text: str) -> str:
+    """
+    FIX #9: Remove lines that contain issue/booking dates so the generic
+    date extractor cannot accidentally return the ticket-issue date
+    instead of the actual travel/departure date.
+    """
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        suppress = any(p.search(line) for p in ISSUE_DATE_PATTERNS)
+        if not suppress:
+            cleaned.append(line)
+    return '\n'.join(cleaned)
+
+
 def _extract_date(text: str) -> Optional[str]:
+    # FIX #9: Try explicit departure/travel date labels first (highest priority).
+    travel_date_patterns = [
+        r'(?:Departure|Travel|Journey|Dep(?:arture)?)\s*Date[:\s]+(\d{1,2}[-/\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-/\s]\d{2,4})',
+        r'(?:Departure|Travel|Journey|Dep(?:arture)?)\s*Date[:\s]+(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
+        # Air India table row: "Sat, 1 Jun 2019" in a DATE column
+        r'\bDATE\b[^\n]*\n[^\n]*?\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})\b',
+    ]
+    for p in travel_date_patterns:
+        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            raw = m.group(1).strip()
+            normalized = _normalize_date(raw)
+            if normalized:
+                return normalized
+
+    # Strip issue/booking date lines before running generic patterns
+    # so we don't accidentally return the issue date.
+    text_for_dates = _strip_issue_dates(text)
+
     date_patterns = [
         r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\s]+(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})',
         r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\s]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{1,2}[,\s]+\d{4})',
         r'\b(\d{1,2}[-\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-\s]\d{2,4})\b',
         r'\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}[,\s]+\d{4})\b',
-        r'(?:Departure|Travel|Journey|Dep)\s*Date[:\s]+(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})',
         r'\b(\d{4}-\d{2}-\d{2})\b',
         r'\b(\d{1,2}/\d{1,2}/\d{4})\b',
+        # IndiGo boarding pass "Date : 24 Oct 19"
+        r'Date\s*[:\-]?\s*(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{2,4})',
+        r'\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{2})\b',
     ]
 
     for p in date_patterns:
-        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
+        m = re.search(p, text_for_dates, re.IGNORECASE | re.MULTILINE)
         if m:
             raw = m.group(1).strip()
             normalized = _normalize_date(raw)
@@ -404,12 +596,12 @@ def _extract_date(text: str) -> Optional[str]:
     m = re.search(
         r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\.]?\s+'
         r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{4})',
-        text, re.IGNORECASE
+        text_for_dates, re.IGNORECASE
     )
     if m:
         return _normalize_date(m.group(1))
 
-    m = re.search(r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{4})\b', text)
+    m = re.search(r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{4})\b', text_for_dates)
     if m:
         return _normalize_date(m.group(1))
 
@@ -422,10 +614,10 @@ def _normalize_date(raw: str) -> Optional[str]:
     raw = re.sub(r'\s+', ' ', raw.strip())
 
     fmt_list = [
-        "%d %b %Y",   "%d-%b-%Y",  "%d/%b/%Y",
+        "%d %b %Y",   "%d-%b-%Y",   "%d/%b/%Y",
         "%d %B %Y",   "%d-%B-%Y",
-        "%B %d, %Y",  "%b %d, %Y", "%b %d %Y",
-        "%d-%m-%Y",   "%d/%m/%Y",  "%m/%d/%Y",
+        "%B %d, %Y",  "%b %d, %Y",  "%b %d %Y",
+        "%d-%m-%Y",   "%d/%m/%Y",   "%m/%d/%Y",
         "%Y-%m-%d",
         "%d %b %y",   "%d-%b-%y",
     ]
@@ -478,7 +670,7 @@ def _extract_from_tables(pdf_path_or_bytes) -> Dict[str, Any]:
                             for cell in row
                         ]
                         row_upper = [c.upper() for c in row_clean]
-                        if any(h in row_upper for h in ['NAME', 'PNR', 'AIRLINE', 'DEPARTURE', 'ARRIVAL']):
+                        if any(h in row_upper for h in ['NAME', 'PNR', 'AIRLINE PNR', 'AIRLINE', 'DEPARTURE', 'ARRIVAL']):
                             headers = row_upper
                             continue
                         if headers and row_clean:
@@ -489,12 +681,12 @@ def _extract_from_tables(pdf_path_or_bytes) -> Dict[str, Any]:
                                 if not val or val.upper() in ('NA', 'N/A', '-', ''):
                                     continue
 
-                                if 'NAME' in header and 'name' not in result:
+                                if ('PASSENGER' in header or 'NAME' in header) and 'name_raw' not in result:
                                     result['name_raw'] = val
-                                elif 'PNR' in header and 'pnr' not in result:
-                                    if not OTA_REF_PATTERN.match(val):
+                                elif ('AIRLINE PNR' in header or header == 'PNR') and 'pnr' not in result:
+                                    if not OTA_REF_PATTERN.match(val) and _is_valid_pnr(val):
                                         result['pnr'] = val.upper()
-                                elif 'AIRLINE' in header and 'airline' not in result:
+                                elif 'AIRLINE' in header and 'AIRLINE PNR' not in header and 'airline' not in result:
                                     result['airline'] = val
                                 elif 'DESTINATION' in header and 'dest_raw' not in result:
                                     m = re.search(r'([A-Z]{3})\s*[-–]\s*([A-Z]{3})', val.upper())
@@ -575,10 +767,9 @@ def parse_ticket_text(raw_text: str, table_hints: Optional[Dict] = None) -> Dict
 def _preprocess_image(file_bytes: bytes) -> bytes:
     """
     Resize large images to max 2000px and convert to JPEG.
-    Vision API works best under 4MB — this keeps it light.
+    Vision API works best under 4MB.
     """
     if not PIL_AVAILABLE:
-        # Return as-is if Pillow not installed
         return file_bytes
 
     img = Image.open(io.BytesIO(file_bytes)).convert('RGB')
@@ -602,12 +793,8 @@ def parse_ticket_image_google(file_bytes: bytes) -> Dict[str, Any]:
       1. Enable Cloud Vision API at console.cloud.google.com
       2. Create an API key under APIs & Services → Credentials
       3. Set env variable: GOOGLE_VISION_API_KEY=your_key_here
-         (or add to .env file if using python-dotenv)
-
-    Free tier: 1000 images/month — plenty for a travel agent tool.
     """
     api_key = GOOGLE_VISION_API_KEY
-
     if not api_key:
         return {
             "error": (
@@ -620,41 +807,26 @@ def parse_ticket_image_google(file_bytes: bytes) -> Dict[str, Any]:
         print("  ⚠️  Pillow not installed — skipping image preprocessing (pip install Pillow)")
 
     try:
-        # Step 1: Preprocess image (resize + compress)
         processed_bytes = _preprocess_image(file_bytes)
         b64_image = base64.b64encode(processed_bytes).decode('utf-8')
 
-        # Step 2: Call Google Vision API
-        # DOCUMENT_TEXT_DETECTION is better than TEXT_DETECTION for structured docs
         payload = {
             "requests": [{
-                "image": {
-                    "content": b64_image
-                },
-                "features": [
-                    {
-                        "type": "DOCUMENT_TEXT_DETECTION",
-                        "maxResults": 1
-                    }
-                ]
+                "image": {"content": b64_image},
+                "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}]
             }]
         }
 
         url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-
         response = requests.post(url, json=payload, timeout=20)
         response.raise_for_status()
 
         data = response.json()
-
-        # Step 3: Extract text from response
         responses = data.get('responses', [{}])
         if not responses:
             return {"error": "Empty response from Google Vision API"}
 
         first = responses[0]
-
-        # Check for API-level error
         if 'error' in first:
             err = first['error']
             return {"error": f"Google Vision API error {err.get('code')}: {err.get('message')}"}
@@ -665,7 +837,6 @@ def parse_ticket_image_google(file_bytes: bytes) -> Dict[str, Any]:
         if not raw_text:
             return {"error": "Google Vision found no text in the image. Try a clearer photo."}
 
-        # Step 4: Feed OCR text into the same parser
         result = parse_ticket_text(raw_text)
         result['source']      = 'image_google_vision'
         result['raw_preview'] = raw_text[:400]
@@ -710,7 +881,6 @@ def parse_ticket_pdf(file_path_or_bytes) -> Dict[str, Any]:
         with open(file_path_or_bytes, 'rb') as f:
             pdf_bytes = f.read()
 
-    # Step 1: Extract all text
     full_text  = ""
     page_count = 0
     try:
@@ -726,10 +896,8 @@ def parse_ticket_pdf(file_path_or_bytes) -> Dict[str, Any]:
     if not full_text.strip():
         return {"error": "Could not extract text — PDF may be a scanned image. Try uploading as JPG/PNG instead."}
 
-    # Step 2: Table extraction for structured OTA PDFs
     table_hints = _extract_from_tables(io.BytesIO(pdf_bytes))
 
-    # Step 3: Parse
     result = parse_ticket_text(full_text, table_hints=table_hints)
     result['source'] = 'pdf'
     result['pages']  = page_count
@@ -744,12 +912,8 @@ async def parse_ticket_upload(upload_file) -> Dict[str, Any]:
     """
     Universal drop-in for FastAPI route — auto-detects PDF vs image.
 
-    Usage in your route:
+    Usage:
         result = await parse_ticket_upload(file)
-
-    Supported formats:
-        PDF  → pdfplumber text extraction + table hints
-        JPG/JPEG/PNG/WEBP/BMP → Google Cloud Vision OCR
 
     Example FastAPI route:
         @app.post("/upload-ticket")
@@ -762,24 +926,15 @@ async def parse_ticket_upload(upload_file) -> Dict[str, Any]:
         return {"error": "Empty file uploaded"}
 
     filename = getattr(upload_file, 'filename', '').lower().strip()
-
-    # Get extension
-    if '.' in filename:
-        ext = '.' + filename.rsplit('.', 1)[-1]
-    else:
-        ext = ''
+    ext = ('.' + filename.rsplit('.', 1)[-1]) if '.' in filename else ''
 
     if ext == '.pdf':
         return parse_ticket_pdf(content)
-
     elif ext in SUPPORTED_IMAGE_TYPES:
         return parse_ticket_image_google(content)
-
     else:
         supported = ', '.join(['.pdf'] + list(SUPPORTED_IMAGE_TYPES.keys()))
-        return {
-            "error": f"Unsupported file type '{ext}'. Supported formats: {supported}"
-        }
+        return {"error": f"Unsupported file type '{ext}'. Supported formats: {supported}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -789,13 +944,10 @@ async def parse_ticket_upload(upload_file) -> Dict[str, Any]:
 if __name__ == "__main__":
     import sys
 
-    # ── Test with a real file if path provided ────────────────────────────────
     if len(sys.argv) > 1:
         file_path = sys.argv[1]
-        ext = '.' + file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
-
+        ext = ('.' + file_path.rsplit('.', 1)[-1].lower()) if '.' in file_path else ''
         print(f"\nParsing: {file_path}  (detected type: {ext})")
-
         if ext == '.pdf':
             result = parse_ticket_pdf(file_path)
         elif ext in SUPPORTED_IMAGE_TYPES:
@@ -812,8 +964,105 @@ if __name__ == "__main__":
         print(f"\n  Raw preview:\n{result.get('raw_preview', '')}\n")
         sys.exit(0)
 
-    # ── Built-in text-based tests ─────────────────────────────────────────────
+    # ── Built-in test suite ───────────────────────────────────────────────────
     tests = [
+        {
+            "label": "Air India Web E-Ticket (v6 NEW — the failing ticket)",
+            "text": """
+Web E-Ticket Itinerary Receipt
+Issuing Airline: Air India
+Issued date: Sun, 26 May 2019
+Web Reference: AIBE48200917
+Booking reference no (PNR): JBT5M (AI)
+
+PASSENGER/ ITINERARY DETAILS
+PASSENGER NAME           FREQUENT FLYER NO.   TICKET NO.(S)   SEAT REQUEST
+MR DHANANJAY PAWAR       AI 192309833         098-2119825645  NA
+
+DATE          DEP TIME  FROM          TO             FLIGHT NO  DEP TERMINAL  AIRLINE
+Sat, 1 Jun 2019  20:05  Doha (DOH)   Mumbai (BOM)   AI 9002    NA            AIR INDIA EXPRESS
+
+TRAVEL INFORMATION
+Flight No./ Operated By  Depart               Arrive
+AI 9002                  Doha (DOH)           Mumbai (BOM)
+Operated by Air India    Sat, 1 Jun 2019      Sun, 2 Jun 2019, 02:15, Terminal 2
+Express, IX 244          20:05
+""",
+            "expect": {
+                "name":           "Mr. Dhananjay Pawar",
+                "pnr":            "JBT5M",
+                "flight_number":  "AI9002",
+                "origin":         "DOH",
+                "destination":    "BOM",
+                "departure_date": "2019-06-01",
+            }
+        },
+        {
+            "label": "IndiGo Boarding Pass (v5 regression — the failing ticket)",
+            "text": """
+Boarding Pass
+
+IndiGo   Boarding pass (web Check-in)   GoIndiGo.in
+
+Name :  MR PAVAN  REDDY
+From :  Visakhapatnam    To :  Hyderabad
+Flight No :  6E  776    Date :  24 Oct 19
+Boarding Time :  18:35  Departure Time :  19:20
+Sequence# :  106        Class :  Q
+Gate# :                 Seat# :  18E
+
+SPECIAL SERVICES
+Name :   MR PAVAN  REDDY
+PNR :    HJNCQT
+Flt# :   6E  776
+Seat# :  18E
+Seq# :   106
+
+From :        Visakhapatnam
+To :          Hyderabad
+Flight No. :  6E 776
+Date :        24 Oct 19
+Boarding Time : 18:35
+Departure Time: 19:20
+Seq# :  106   Class :  Q
+Gate# :       Seat# :  18E
+""",
+            "expect": {
+                "name":           "Mr. Pavan Reddy",
+                "pnr":            "HJNCQT",
+                "flight_number":  "6E776",
+                "origin":         "VTZ",
+                "destination":    "HYD",
+            }
+        },
+        {
+            "label": "MakeMyTrip / IndiGo (table format)",
+            "text": """
+6/19/2015                    Eticket-Dom-Flight
+E-Ticket
+MakeMyTrip Booking ID -NF2203354197300
+Booking Date -Fri, 19 Jun 2015
+
+Itinerary and Reservation Details
+
+IndiGo
+Indigo  6E-198
+Departure               Arrival
+Mumbai (BOM)            Delhi (DEL)
+Terminal 1B             Terminal 1C
+Fri, 19 Jun 2015 22:10  Sat, 20 Jun 2015 00:20
+
+Passenger Name  Type    Airline PNR  E-Ticket Number
+Aishwarya Singh Adult   TCNNFN       TCNNFN
+""",
+            "expect": {
+                "name":           "Aishwarya Singh",
+                "pnr":            "TCNNFN",
+                "flight_number":  "6E198",
+                "origin":         "BOM",
+                "destination":    "DEL",
+            }
+        },
         {
             "label": "Yatra / Vistara",
             "text": """
@@ -829,6 +1078,13 @@ AIRLINE   DEPARTURE              ARRIVAL               DURATION  PNR
 Vistara   Wed, Nov 18 2020       Wed, Nov 18 2020      Non Stop  M96DOE
 UK - 645  13:25 Hrs              14:35 Hrs
 """,
+            "expect": {
+                "name":           "Mr. Shekhar Tomer",
+                "pnr":            "M96DOE",
+                "flight_number":  "UK645",
+                "origin":         "DEL",
+                "destination":    "IXJ",
+            }
         },
         {
             "label": "Air India direct",
@@ -840,19 +1096,12 @@ Flight: AI 191
 Route: BOM – LHR
 Date: 20-Jun-2025  |  Time: 02:30
 """,
-        },
-        {
-            "label": "IndiGo / MakeMyTrip",
-            "text": """
-makemytrip
-BOOKING CONFIRMED
-Booking ID: NF2204567890123
-PNR: ABCD12
-Dear Priya Mehta,
-IndiGo 6E-2541
-Mumbai (BOM) → Delhi (DEL)
-Date: 25 Dec 2024
-""",
+            "expect": {
+                "pnr":            "XKTP72",
+                "flight_number":  "AI191",
+                "origin":         "BOM",
+                "destination":    "LHR",
+            }
         },
         {
             "label": "Emirates direct",
@@ -864,23 +1113,53 @@ EK 506
 Dubai (DXB) to Mumbai (BOM)
 Date: 14 Mar 2025
 """,
+            "expect": {
+                "pnr":            "GHJ45K",
+                "flight_number":  "EK506",
+                "origin":         "DXB",
+                "destination":    "BOM",
+            }
         },
     ]
 
     all_pass = True
     print("\n" + "="*60)
-    print("  Running built-in test suite")
+    print("  Running built-in test suite  (v6)")
     print("="*60)
 
     for t in tests:
         result = parse_ticket_text(t["text"])
-        ok = result["confidence"] >= 0.6
+        expect = t.get("expect", {})
+
+        field_checks = []
+        for field, expected_val in expect.items():
+            actual = result.get(field, '')
+            if field == 'name':
+                actual_core   = re.sub(r'^(Mr|Mrs|Ms|Miss|Dr)\.\s*', '', actual or '', flags=re.IGNORECASE).strip().lower()
+                expected_core = re.sub(r'^(Mr|Mrs|Ms|Miss|Dr)\.\s*', '', expected_val, flags=re.IGNORECASE).strip().lower()
+                match = actual_core == expected_core
+            else:
+                match = (actual or '').upper() == expected_val.upper()
+            field_checks.append((field, expected_val, actual, match))
+
+        ok = result["confidence"] >= 0.6 and all(m for _, _, _, m in field_checks)
         status = "✅ PASS" if ok else "❌ FAIL"
         if not ok:
             all_pass = False
+
         print(f"\n{status}  [{t['label']}]  conf={result['confidence']}")
         for k in ['name', 'pnr', 'flight_number', 'airline', 'origin', 'destination', 'departure_date']:
-            print(f"  {k:16}: {result.get(k) or '—'}")
+            actual = result.get(k) or '—'
+            exp = expect.get(k)
+            marker = ''
+            if exp:
+                if k == 'name':
+                    actual_core   = re.sub(r'^(Mr|Mrs|Ms|Miss|Dr)\.\s*', '', str(actual), flags=re.IGNORECASE).strip().lower()
+                    expected_core = re.sub(r'^(Mr|Mrs|Ms|Miss|Dr)\.\s*', '', exp, flags=re.IGNORECASE).strip().lower()
+                    marker = ' ✓' if actual_core == expected_core else f' ✗ (expected: {exp})'
+                else:
+                    marker = ' ✓' if (actual or '').upper() == exp.upper() else f' ✗ (expected: {exp})'
+            print(f"  {k:16}: {actual}{marker}")
 
     print(f"\n{'All tests passed ✅' if all_pass else 'Some tests failed ❌'}")
     print("\nUsage: python pdf_parser.py path/to/ticket.pdf")
